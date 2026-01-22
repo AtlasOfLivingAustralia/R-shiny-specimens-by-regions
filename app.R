@@ -7,13 +7,52 @@ library(shiny)
 library(stringr)
 library(tibble)
 
+# internal functions
+make_occurrence_query <- function(x){
+  y <- httr2::url_parse(x)
+  y$hostname <- "biocache.ala.org.au"
+  y$path <- "occurrences/search"
+  fq <- y$query$fq |>
+    stringr::str_replace_all("\\\"", "") |>
+    strsplit(" AND ") |>
+    purrr::pluck(!!!list(1)) |>
+    stringr::str_replace_all("\\(|\\)", "") |>
+    stringr::str_replace("basisOfRecord", "basis_of_record") |>
+    stringr::str_replace("taxonConceptID", "lsid") |>
+    stringr::str_replace("raw_scientificName", "raw_scientific_name") |>
+    as.list()
+  names(fq) <- rep("fq", length(fq))
+  y$query <- fq
+  httr2::url_build(y)
+}
+
+make_bie_query <- function(x){
+  y <- httr2::url_parse(x)
+  fq <- y$query$fq
+  if(stringr::str_detect(fq, "taxonConceptID")){ # go to taxon page
+    taxon_id <- fq |>
+      strsplit(" AND ") |>
+      purrr::pluck(!!!list(1, 1)) |>
+      stringr::str_replace("\\(taxonConceptID:", "") |>
+      stringr::str_replace_all("\"", "") |>
+      stringr::str_replace("\\)", "")
+    paste0("https://bie.ala.org.au/species/", taxon_id)
+  }else{ # run a search on ALA 
+    taxon_name <- fq |>
+      strsplit(" AND ") |>
+      purrr::pluck(!!!list(1, 1)) |>
+      stringr::str_replace("\\(raw_scientificName:", "") |>
+      stringr::str_replace_all("\"", "") |>
+      stringr::str_replace("\\)", "")
+    paste0("https://bie.ala.org.au/search?q=", taxon_name)
+  }
+}
+
 # left column shows regions
 region_card <- bslib::card(
   card_header("Regions"),
   card_body(
-    tableOutput("region_result")
-    # verbatimTextOutput("query_result") ## testing only
-  ),
+    tableOutput("region_result")),
   card_footer(
     downloadButton(outputId = "download_json",
                    label = "JSON"),
@@ -27,10 +66,8 @@ taxon_card <- bslib:::card(
   card_header("Taxon"),
   tableOutput("taxa_result"),
   card_footer(
-    actionButton(inputId = "to_biocache",
-                 label = "View Records"),
-    actionButton(inputId = "to_bde",
-                 label = "View Taxon")
+    uiOutput("to_biocache"),
+    uiOutput("to_bie")
   )
 )
 
@@ -69,7 +106,9 @@ server <- function(input, output) {
   data_stored <- reactiveValues(
     search_taxa_result = tibble::tibble(),
     region_query = NA,
-    region_result = tibble::tibble())
+    region_result = tibble::tibble(),
+    ala_occurrences = NA,
+    ala_species = NA)
   
   # add actions when `search` is called
   observeEvent(input$search, {
@@ -91,9 +130,13 @@ server <- function(input, output) {
                    basisOfRecord == "PRESERVED_SPECIMEN") |> 
             group_by(region_type) |> 
             count() |> 
-            arrange(region_type) 
+            arrange(region_type) |>
+            collapse()
           
+          data_stored$ala_occurrences <- make_occurrence_query(data_stored$region_query$url)
+          data_stored$ala_species <- make_bie_query(data_stored$region_query$url)
           data_stored$region_result <- collect(data_stored$region_query)
+
         }else{
           showModal(modalDialog(title = "Taxon not found"))
         }
@@ -107,9 +150,13 @@ server <- function(input, output) {
             basisOfRecord == "PRESERVED_SPECIMEN") |> 
           group_by(region_type) |> 
           count() |>
-          arrange(region_type)
+          arrange(region_type) |>
+          collapse()
         
+        data_stored$ala_occurrences <- make_occurrence_query(data_stored$region_query$url)
+        data_stored$ala_species <- make_bie_query(data_stored$region_query$url)
         query_result <- collect(data_stored$region_query)
+
         if(nrow(query_result) < 1){
           showModal(modalDialog(title = "No data found"))
           data_stored$region_result <- tibble::tibble()
@@ -147,12 +194,9 @@ server <- function(input, output) {
       output$taxa_result <- renderTable(tibble::tibble())
 
     }
-    
-    ## for testing only
-    # output$query_result <- renderPrint(httr2::url_parse(data_stored$region_query$url))
   })
   
-  # enable download buttons
+  # enable download button (csv)
   output$download_csv <- downloadHandler(
     filename = "test.csv",
     content = function(file){
@@ -161,7 +205,7 @@ server <- function(input, output) {
                 row.names = FALSE)
     })
   
-  # enable download buttons
+  # enable download button (json)
   output$download_json <- downloadHandler(
     filename = "test.txt",
     content = function(file){
@@ -171,6 +215,26 @@ server <- function(input, output) {
         jsonlite::toJSON(auto_unbox = TRUE) |>
         writeLines(con = file)
     })
+  
+  # enable exit to occurrences (new tab)
+  output$to_biocache <- renderUI({
+    if(!is.na(data_stored$ala_occurrences)){
+      tags$a(href = data_stored$ala_occurrences, 
+             class = "btn btn-default", 
+             target = "_blank",
+             "View Occurrences")
+    }
+  })
+
+  # enable exit to bie (new tab)
+  output$to_bie <- renderUI({
+    if(!is.na(data_stored$ala_species)){
+      tags$a(href = data_stored$ala_species, 
+             class = "btn btn-default", 
+             target = "_blank",
+             "View Taxon")
+    }
+  })
 
 }
 
